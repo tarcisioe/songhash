@@ -8,10 +8,10 @@ from typing import Sequence, Mapping
 from threading import Thread
 from queue import Queue
 
-from typer import Typer
+import typer
 
 
-APP = Typer()
+APP = typer.Typer()
 
 
 @dataclass(frozen=True)
@@ -52,7 +52,10 @@ class SongHash:
         )
 
 
-Database = Mapping[Path, SongHash]
+@dataclass
+class Database:
+    base_directory: Path
+    hashes: Mapping[Path, SongHash]
 
 
 def read_songs_into_queue(song_file_data: Sequence[SongFileData], q: Queue[Song | None]) -> None:
@@ -91,17 +94,23 @@ def get_old_database(filename: Path) -> Database | None:
 
 
     with filename.open("r") as f:
-        split_lines = (line.split('\t') for line in f.readlines())
+        header, *file_lines = (l.strip() for l in f.readlines())
+        split_lines = (line.split('\t') for line in file_lines)
 
-        return {
-            (path := Path(file)): SongHash(path, sha256, int(timestamp_ns))
-            for file, sha256, timestamp_ns in
-            split_lines
-        }
+        base_directory = Path(header)
+
+        return Database(
+            base_directory,
+            {
+                (path := base_directory / file): SongHash(path, sha256, int(timestamp_ns))
+                for file, sha256, timestamp_ns in
+                split_lines
+            }
+        )
 
 
 def get_timestamp_from_database(database: Database, song_path: Path) -> int:
-    song_hash = database.get(song_path)
+    song_hash = database.hashes.get(song_path)
 
     if song_hash is None:
         return 0
@@ -124,23 +133,33 @@ def merge(old_database: Database | None, new_hashes: Sequence[SongHash]) -> list
     if old_database is None:
         return list(new_hashes)
 
-    database = dict(old_database)
+    database = dict(old_database.hashes)
     database.update((s.path, s) for s in new_hashes)
     return list(database.values())
 
 
-def output(hashes: Sequence[SongHash], filename: Path) -> None:
+def output(directory: Path, hashes: Sequence[SongHash], filename: Path) -> None:
     hashes = sorted(hashes, key=lambda h: h.path)
 
     with open(filename, "w") as f:
+        print(directory, file=f)
         for song_hash in hashes:
-            print(f'{song_hash.path}\t{song_hash.sha256}\t{song_hash.timestamp_ns}', file=f)
+            print(f'{song_hash.path.relative_to(directory)}\t{song_hash.sha256}\t{song_hash.timestamp_ns}', file=f)
 
 
 @APP.command()
-def main(directory: Path, filename: Path) -> None:
+def main(directory: Path, filename: Path, base_directory: Path | None = None) -> None:
+    base_directory = directory if base_directory is None else base_directory
+
+    base_directory = base_directory.absolute()
+    directory = directory.absolute()
+
     song_paths = [SongFileData(s, s.stat().st_mtime_ns) for s in Path(sys.argv[1]).rglob('*') if s.is_file() and s.suffix in ('.mp3', '.m4a')]
     old_database = get_old_database(filename)
+
+    if old_database is not None and old_database.base_directory != base_directory:
+        print("Cowardly refusing to update a database for a different directory.", file=sys.stderr)
+        raise typer.Exit(1)
 
     songs_to_update = get_songs_to_update(song_paths, old_database)
 
@@ -150,7 +169,7 @@ def main(directory: Path, filename: Path) -> None:
 
     new_hashes = hash_songs(songs_to_update)
 
-    output(merge(old_database, new_hashes), filename)
+    output(base_directory, merge(old_database, new_hashes), filename)
 
 
 if __name__ == '__main__':
